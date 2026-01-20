@@ -1,0 +1,26 @@
+// HY3 File Example (Simplified)
+
+// Team Header
+TEAM=MY_CLUB_NAME
+TEAM_CODE=MYCLB
+# ... other team info
+
+// Swimmer Record (Example: John Doe)
+SWIMMER=12345
+NAME=DOE,JOHN
+GENDER=M
+DOB=2008-05-15
+# ... more swimmer details
+
+// Entry Record (John Doe in 100 Free)
+ENTRY=12345,100,FREE,01
+# ... entry details (seed time, etc.)
+
+// Event Record (Example: 100 Freestyle)
+EVENT=100,FREE,01
+DESCRIPTION=100 Meter Freestyle
+# ... event details
+
+// More swimmers and entries...
+
+// End of File Marker (often implied or a specific character)
