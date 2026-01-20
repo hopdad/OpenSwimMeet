@@ -1,5 +1,4 @@
-customtkinter==5.2.2          # Modern Tkinter theme (pip install customtkinter)
-reportlab==4.0.9              # For PDF psych sheets
-sqlite3                       # Built-in
-# Optional: pandas for easier data handling in seeding
-# pandas==2.2.2
+PyQt6==6.7.0  # Core GUI framework (use latest stable; adjust if needed)
+reportlab==4.2.2  # For PDF psych sheets (updated to latest)
+# Optional: pyqt6-tools for Qt Designer
+# pyqt6-tools==6.7.0.20240112
