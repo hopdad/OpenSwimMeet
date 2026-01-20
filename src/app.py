@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QFileDialog, QMessageBox, QTabWidget, QTableView
 from PyQt6.QtSql import QSqlDatabase, QSqlQueryModel
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QMimeData
 from src.database import init_db, open_meet_db  # Your SQLite helpers (unchanged)
 
 class MainApp(QMainWindow):
@@ -12,6 +13,8 @@ class MainApp(QMainWindow):
 
         self.db_conn = None
         self.current_meet_path = None
+
+        self.setAcceptDrops(True)  # Enable drag-and-drop on the whole window
 
         self.setup_ui()
         self.show_welcome_screen()
@@ -135,9 +138,38 @@ class MainApp(QMainWindow):
         import_btn.clicked.connect(self.import_team_entries)  # TODO: Implement
         self.layout.addWidget(import_btn)
 
-    def import_team_entries(self):
-        # Placeholder for import/merge flow
-        path, _ = QFileDialog.getOpenFileName(self, "Import .HY3 File", "", "Hy-Tek Entries (*.hy3 *.HY3)")
-        if path:
-            # Call your hy3_parser here
-            QMessageBox.information(self, "Import", f"Imported from {path}. Merge functionality coming soon!")
+    def import_team_entries(self, file_path=None):
+        # If file_path provided (from drop), use it; else open dialog
+        if not file_path:
+            file_path, _ = QFileDialog.getOpenFileName(self, "Import .HY3 File", "", "Hy-Tek Entries (*.hy3 *.HY3)")
+        if file_path:
+            # TODO: Call hy3_parser.parse_hy3_file(file_path) and insert into DB
+            # For now, placeholder
+            QMessageBox.information(self, "Import", f"Imported from {file_path}. Merge functionality coming soon!")
+
+    # Drag-and-Drop Event Handlers
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls() and self.current_meet_path:  # Only accept if meet is loaded
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        if event.mimeData().hasUrls() and self.current_meet_path:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        if event.mimeData().hasUrls() and self.current_meet_path:
+            urls = event.mimeData().urls()
+            for url in urls:
+                file_path = url.toLocalFile()
+                if file_path.lower().endswith(('.hy3', '.HY3')):
+                    self.import_team_entries(file_path)
+                    event.acceptProposedAction()
+                    return
+            QMessageBox.warning(self, "Invalid File", "Only .HY3 files are supported for drag-and-drop.")
+            event.ignore()
+        else:
+            event.ignore()
