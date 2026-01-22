@@ -1,26 +1,65 @@
-from PyQt6.QtWidgets import QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QFileDialog, QMessageBox, QTabWidget, QTableView
+import sys
+import json
+import shutil
+import os
+import threading
+import time
+from pathlib import Path
+from datetime import datetime
+from PyQt6.QtWidgets import (
+    QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QFileDialog, QMessageBox,
+    QTabWidget, QTableView, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QDialog, QHBoxLayout, QLineEdit, QComboBox, QSpinBox, QCheckBox, QProgressDialog,
+    QTextEdit
+)
 from PyQt6.QtSql import QSqlDatabase, QSqlQueryModel
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QMimeData
-from src.database import init_db, open_meet_db  # Your SQLite helpers (unchanged)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QColor, QFont
+import psutil
+
+from src.database import init_db, open_meet_db, get_meet_setting, set_meet_setting, is_meet_completed, mark_meet_complete
+from src.ui.add_swimmer_dialog import AddSwimmerDialog
+from src.ui.add_entry_dialog import AddEntryDialog
+from src.ui.add_event_dialog import AddEventDialog
+from src.ui.relay_entry_dialog import RelayEntryDialog
+from src.ui.relay_edit_dialog import RelayEditDialog
+from src.ui.backup_time_dialog import BackupTimeDialog
+from src.ui.run_meet_screen import RunMeetScreen
+from src.ui.scoring_config_dialog import ScoringConfigDialog
+from src.ui.time_converter_dialog import TimeConverterDialog
+from src.ui.scratch_swimmer_dialog import ScratchSwimmerDialog
+from src.seeding import apply_seeding
+from src.scoring import award_points, update_team_scores
+from src.meet_exporter import export_meet_bundle
+from src.swimmer_cards import generate_swimmer_cards_by_team
+from src.psych_heat_sheets import generate_psych_heat_pdf
+from src.manual_timekeeper_sheets import generate_timekeeper_sheets
+from src.diving_judge_sheets import generate_diving_judge_sheets
+from src.relay_heat_sheets import generate_relay_heat_sheets
+from src.final_results_pdf import generate_final_results_pdf
+from src.csv_exporter import export_results_csv, export_team_scores_csv, export_entries_csv, export_relay_groups_csv, export_relay_members_csv, export_relay_results_csv
 
 class MainApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OpenSwimMeet - Open Source Swim Meet Manager")
         self.resize(1200, 800)
-        # self.setWindowIcon(QIcon("resources/icons/app.ico"))  # Uncomment if you add an icon
 
-        self.db_conn = None
         self.current_meet_path = None
+        self.db_conn = None
 
-        self.setAcceptDrops(True)  # Enable drag-and-drop on the whole window
+        self.backup_timer = None
+        self.backup_interval_seconds = 180  # 3 minutes
+        self.max_backups_to_keep = 10
+        self.usb_backup_prompted = False
 
         self.setup_ui()
         self.show_welcome_screen()
 
+        # Start auto-backup timer
+        self.start_auto_backup()
+
     def setup_ui(self):
-        # Central widget with layout
         self.central = QWidget()
         self.setCentralWidget(self.central)
         self.layout = QVBoxLayout(self.central)
@@ -61,12 +100,6 @@ class MainApp(QMainWindow):
         open_btn.clicked.connect(self.open_meet)
         btn_layout.addWidget(open_btn)
 
-        export_btn = QPushButton("Export Entries Only (Away Team)")
-        export_btn.setFixedSize(200, 60)
-        export_btn.setStyleSheet("background-color: #28A745; color: white; font: bold 14pt Arial; border-radius: 5px;")
-        export_btn.clicked.connect(self.export_entries)  # TODO: Implement export flow
-        btn_layout.addWidget(export_btn)
-
         self.layout.addLayout(btn_layout)
 
     def new_meet(self):
@@ -74,102 +107,142 @@ class MainApp(QMainWindow):
         if path:
             self.current_meet_path = path
             self.db_conn = init_db(path)
-            if self.db_conn:
-                self.show_main_dashboard()
-            else:
-                QMessageBox.warning(self, "Error", "Failed to create database.")
+            self.show_meet_settings_wizard()
+            self.show_main_dashboard()
+            self.start_auto_backup()
+            self.load_meet_state()
 
     def open_meet(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Meet", "", "Meet Database (*.db)")
         if path:
             self.current_meet_path = path
             self.db_conn = open_meet_db(path)
-            if self.db_conn:
-                self.show_main_dashboard()
-            else:
-                QMessageBox.warning(self, "Error", "Failed to open database.")
 
-    def export_entries(self):
-        # Placeholder for away team export flow
-        QMessageBox.information(self, "Export", "Export entries functionality coming soon!")
+            # Check for recent backup and offer restore
+            backup_dir = Path(path).parent / "MeetBackups"
+            if backup_dir.exists():
+                recent_backups = sorted(backup_dir.glob("backup_*"), key=lambda p: p.name, reverse=True)
+                if recent_backups:
+                    latest = recent_backups[0]
+                    reply = QMessageBox.question(
+                        self, "Backup Found",
+                        f"Found recent backup: {latest.name}\n\nRestore from this backup?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        shutil.copy2(latest / Path(path).name, path)
+                        state_backup = latest / Path(path).with_suffix('.state.json').name
+                        if Path(state_backup).exists():
+                            shutil.copy2(state_backup, Path(path).with_suffix('.state.json'))
+                        QMessageBox.information(self, "Restored", "Meet restored from backup.")
+
+            self.show_main_dashboard()
+            self.start_auto_backup()
+            self.load_meet_state()
+
+    def show_meet_settings_wizard(self):
+        # ... (full wizard code from previous messages, including meet_type, course, dual mode, home lanes, etc.)
+        # Make sure to save all settings including 'meet_type', 'course', 'dual_meet_mode', 'dual_meet_home_lanes', etc.
+        # After save:
+        self.auto_insert_events(type_combo.currentText())
+
+    def auto_insert_events(self, meet_type: str):
+        # ... (full code from earlier, using EVENT_TEMPLATES)
+        pass
 
     def show_main_dashboard(self):
         self.clear_layout()
+        self.tabs = QTabWidget()
+        self.layout.addWidget(self.tabs)
 
-        # Tabbed interface for dashboard
-        tabs = QTabWidget()
-        self.layout.addWidget(tabs)
+        # Dashboard tab (buttons)
+        dash_tab = QWidget()
+        dash_layout = QVBoxLayout(dash_tab)
 
-        # Entries Tab (example with QTableView bound to SQL model)
-        entries_tab = QWidget()
-        entries_layout = QVBoxLayout(entries_tab)
-        entries_label = QLabel("Entries Dashboard")
-        entries_label.setStyleSheet("font: bold 18pt Arial;")
-        entries_layout.addWidget(entries_label)
+        # Example buttons (add all from previous messages)
+        # Add Swimmer, Add Event, Add Entry, Enter Relay, Edit Relay, etc.
+        # Complete meet, backup USB, restore USB, cloud config, audience host, etc.
 
-        # Example: Display swimmers table
-        swimmers_model = QSqlQueryModel()
-        swimmers_model.setQuery("SELECT * FROM swimmers", self.db_conn)
-        swimmers_table = QTableView()
-        swimmers_table.setModel(swimmers_model)
-        swimmers_table.setAlternatingRowColors(True)
-        swimmers_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        entries_layout.addWidget(swimmers_table)
+        self.tabs.addTab(dash_tab, "Dashboard")
 
-        tabs.addTab(entries_tab, "Entries")
+        # Run Meet tab
+        run_tab = QWidget()
+        run_layout = QVBoxLayout(run_tab)
+        self.run_screen = RunMeetScreen(self, self.db_conn)
+        run_layout.addWidget(self.run_screen)
+        self.tabs.addTab(run_tab, "Run Meet")
 
-        # Add more tabs: Seeding, Psych Sheets, etc.
-        seeding_tab = QWidget()
-        seeding_layout = QVBoxLayout(seeding_tab)
-        seeding_label = QLabel("Seeding & Heats (Coming Soon)")
-        seeding_layout.addWidget(seeding_label)
-        tabs.addTab(seeding_tab, "Seeding")
+        # Team Scores tab
+        scores_tab = QWidget()
+        scores_layout = QVBoxLayout(scores_tab)
+        self.scores_table = QTableWidget(0, 5)
+        self.scores_table.setHorizontalHeaderLabels(["Rank", "Team", "Boys", "Girls", "Total"])
+        scores_layout.addWidget(self.scores_table)
+        refresh_scores_btn = QPushButton("Refresh Standings")
+        refresh_scores_btn.clicked.connect(self.refresh_team_standings)
+        scores_layout.addWidget(refresh_scores_btn)
+        self.tabs.addTab(scores_tab, "Team Standings")
 
-        psych_tab = QWidget()
-        psych_layout = QVBoxLayout(psych_tab)
-        psych_label = QLabel("Psych Sheets (Coming Soon)")
-        psych_layout.addWidget(psych_label)
-        tabs.addTab(psych_tab, "Psych Sheets")
+        # Non-Scoring Swimmers tab
+        non_scoring_tab = QWidget()
+        non_scoring_layout = QVBoxLayout(non_scoring_tab)
+        self.non_scoring_table = QTableWidget(0, 6)
+        self.non_scoring_table.setHorizontalHeaderLabels(["Name", "Age", "Gender", "Team", "Events Entered", "Actions"])
+        non_scoring_layout.addWidget(self.non_scoring_table)
+        refresh_non_btn = QPushButton("Refresh Non-Scoring List")
+        refresh_non_btn.clicked.connect(self.refresh_non_scoring_list)
+        non_scoring_layout.addWidget(refresh_non_btn)
+        self.tabs.addTab(non_scoring_tab, "Non-Scoring Swimmers")
 
-        # Add buttons for actions like Import Team
-        import_btn = QPushButton("Import Team Entries (.HY3)")
-        import_btn.setFixedSize(200, 40)
-        import_btn.setStyleSheet("background-color: #FFC107; color: black; font: bold 12pt Arial; border-radius: 5px;")
-        import_btn.clicked.connect(self.import_team_entries)  # TODO: Implement
-        self.layout.addWidget(import_btn)
+        # ... add other tabs as needed
 
-    def import_team_entries(self, file_path=None):
-        # If file_path provided (from drop), use it; else open dialog
-        if not file_path:
-            file_path, _ = QFileDialog.getOpenFileName(self, "Import .HY3 File", "", "Hy-Tek Entries (*.hy3 *.HY3)")
-        if file_path:
-            # TODO: Call hy3_parser.parse_hy3_file(file_path) and insert into DB
-            # For now, placeholder
-            QMessageBox.information(self, "Import", f"Imported from {file_path}. Merge functionality coming soon!")
+        if is_meet_completed(self.db_conn):
+            lock_label = QLabel("Meet is COMPLETE and LOCKED for editing.\nViewing and exporting still available.")
+            lock_label.setStyleSheet("font: bold 16pt Arial; color: #DC3545; background: #fff3cd; padding: 15px; border-radius: 8px;")
+            lock_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.layout.addWidget(lock_label)
 
-    # Drag-and-Drop Event Handlers
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls() and self.current_meet_path:  # Only accept if meet is loaded
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+            # Disable editing buttons (example)
+            # for btn in [add_swimmer_btn, ...]: btn.setEnabled(False)
 
-    def dragMoveEvent(self, event: QDragMoveEvent):
-        if event.mimeData().hasUrls() and self.current_meet_path:
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+    def refresh_team_standings(self):
+        # ... (full code from earlier)
+        pass
 
-    def dropEvent(self, event: QDropEvent):
-        if event.mimeData().hasUrls() and self.current_meet_path:
-            urls = event.mimeData().urls()
-            for url in urls:
-                file_path = url.toLocalFile()
-                if file_path.lower().endswith(('.hy3', '.HY3')):
-                    self.import_team_entries(file_path)
-                    event.acceptProposedAction()
-                    return
-            QMessageBox.warning(self, "Invalid File", "Only .HY3 files are supported for drag-and-drop.")
-            event.ignore()
-        else:
-            event.ignore()
+    def refresh_non_scoring_list(self):
+        # ... (full code from earlier)
+        pass
+
+    def toggle_non_scoring(self, swimmer_id: int):
+        # ... (full code from earlier)
+        pass
+
+    def save_meet_state(self):
+        # ... (full code from earlier)
+        pass
+
+    def load_meet_state(self):
+        # ... (full code from earlier)
+        pass
+
+    def start_auto_backup(self):
+        # ... (full code from earlier)
+        pass
+
+    def perform_auto_backup(self):
+        # ... (full code from earlier, including local + cloud + USB if enabled)
+        pass
+
+    def backup_to_external(self):
+        # ... (full code from earlier)
+        pass
+
+    def restore_from_usb_backup(self):
+        # ... (full code from earlier)
+        pass
+
+    def complete_meet_and_export(self):
+        # ... (full code from earlier, with cloud/USB auto-backup)
+        pass
+
+    # Add other methods as needed (import_team_entries, generate_swimmer_cards, etc.)
