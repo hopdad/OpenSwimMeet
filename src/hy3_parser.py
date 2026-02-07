@@ -81,9 +81,9 @@ def parse_hy3_file(file_path: str) -> dict:
                             current_team_name = team_name
 
                     elif record_type == 'D0':
-                        # Individual entry - minimum 96 characters for full record
-                        if len(line) < 96:
-                            parse_errors.append(f"Line {line_num}: D0 record too short ({len(line)} < 96)")
+                        # Individual entry - need at least 39 chars for swimmer name
+                        if len(line) < 39:
+                            parse_errors.append(f"Line {line_num}: D0 record too short ({len(line)} < 39)")
                             continue
                         
                         # Parse swimmer info
@@ -97,7 +97,7 @@ def parse_hy3_file(file_path: str) -> dict:
                         stroke = line[71:72].strip() if len(line) > 71 else ''  # Position 72
                         event_num = line[72:76].strip() if len(line) > 76 else ''  # Positions 73-76
                         age_group = line[76:80].strip() if len(line) > 80 else ''  # Positions 77-80
-                        seed_str = line[88:96].strip() if len(line) > 96 else ''  # Positions 89-96
+                        seed_str = line[88:96].strip() if len(line) >= 96 else (line[88:].strip() if len(line) > 88 else '')  # Positions 89-96
 
                         # Convert seed time
                         seed_time = time_to_seconds(seed_str)
