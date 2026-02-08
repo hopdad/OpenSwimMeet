@@ -16,11 +16,14 @@ from src.database import (
     list_backups, restore_backup, save_undo_point, undo_last_action,
     get_undo_history, check_in_swimmer, check_out_swimmer,
     get_check_in_status, add_announcement, get_announcements,
+    create_relay_team, get_relay_teams, update_relay_team, delete_relay_team,
+    set_relay_legs, get_relay_legs, save_relay_result,
+    calculate_relay_places, assign_relay_points, get_team_swimmers,
     SCORING_TABLES, DQ_CODES,
 )
 from src.hy3_parser import parse_hy3_file, time_to_seconds, seconds_to_time_str
 from src.hy3_exporter import export_to_hy3
-from src.seeding import apply_seeding, get_heat_sheet
+from src.seeding import apply_seeding, get_heat_sheet, get_relay_heat_sheet
 from src.psych_sheets import generate_psych_sheet_pdf, generate_heat_sheet_pdf
 
 
@@ -72,6 +75,8 @@ class MainApp:
         self.refresh_events_list()
         self.refresh_swimmers_list()
         self.refresh_entries_list()
+        if hasattr(self, 'relays_tree'):
+            self.refresh_relays_list()
         if hasattr(self, 'scores_tree'):
             self.refresh_scores()
 
@@ -201,6 +206,8 @@ class MainApp:
         self.notebook.add(self.create_swimmers_tab(), text="Swimmers")
         # Entries tab
         self.notebook.add(self.create_entries_tab(), text="Entries")
+        # Relays tab
+        self.notebook.add(self.create_relays_tab(), text="Relays")
         # Results tab
         self.notebook.add(self.create_results_tab(), text="Results")
         # Scoring tab
@@ -433,6 +440,438 @@ class MainApp:
 
         self.refresh_entries_list()
         return frame
+
+    # ─── Relays Tab ────────────────────────────────────────────────────
+
+    def create_relays_tab(self):
+        """Create relays tab showing relay teams and leg assignments."""
+        frame = ttk.Frame()
+
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill='x', padx=5, pady=5)
+
+        ttk.Button(toolbar, text="Add Relay Team", command=self.add_relay_team_dialog).pack(side='left', padx=2)
+        ttk.Button(toolbar, text="Edit Legs", command=self.edit_relay_legs_dialog).pack(side='left', padx=2)
+        ttk.Button(toolbar, text="Enter Relay Results", command=self.relay_results_dialog).pack(side='left', padx=2)
+        ttk.Button(toolbar, text="Delete Relay", command=self.delete_selected_relay).pack(side='left', padx=2)
+        ttk.Button(toolbar, text="Refresh", command=self.refresh_relays_list).pack(side='left', padx=2)
+
+        # Filter by event
+        ttk.Label(toolbar, text="  Event:").pack(side='left', padx=(10, 2))
+        self.relay_event_filter_var = tk.StringVar(value="All")
+        relay_event_combo = ttk.Combobox(toolbar, textvariable=self.relay_event_filter_var,
+                                         state='readonly', width=30)
+        relay_event_combo.pack(side='left', padx=2)
+        relay_event_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh_relays_list())
+        self._update_relay_event_filter(relay_event_combo)
+
+        columns = ('Event', 'Team', 'Letter', 'Leg 1', 'Leg 2', 'Leg 3', 'Leg 4',
+                   'Seed Time', 'Final Time', 'Place', 'Pts')
+        self.relays_tree = ttk.Treeview(frame, columns=columns, show='headings')
+
+        col_widths = {'Event': 60, 'Team': 70, 'Letter': 40,
+                      'Leg 1': 120, 'Leg 2': 120, 'Leg 3': 120, 'Leg 4': 120,
+                      'Seed Time': 75, 'Final Time': 75, 'Place': 45, 'Pts': 45}
+        for col in columns:
+            self.relays_tree.heading(col, text=col)
+            self.relays_tree.column(col, width=col_widths.get(col, 80))
+
+        self.relays_tree.pack(fill='both', expand=True, padx=5, pady=5)
+
+        scrollbar = ttk.Scrollbar(frame, orient='vertical', command=self.relays_tree.yview)
+        scrollbar.pack(side='right', fill='y')
+        self.relays_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.refresh_relays_list()
+        return frame
+
+    def _update_relay_event_filter(self, combo):
+        """Update the relay event filter combo with relay events."""
+        cursor = self.db_conn.cursor()
+        cursor.execute("SELECT id, number, name FROM events WHERE is_relay = 1 ORDER BY number")
+        events = cursor.fetchall()
+        self._relay_event_map = {'All': None}
+        for eid, num, name in events:
+            key = f"#{num}: {name}"
+            self._relay_event_map[key] = eid
+        combo['values'] = list(self._relay_event_map.keys())
+
+    def refresh_relays_list(self):
+        """Refresh the relay teams treeview."""
+        if not hasattr(self, 'relays_tree'):
+            return
+
+        for item in self.relays_tree.get_children():
+            self.relays_tree.delete(item)
+
+        event_filter = self.relay_event_filter_var.get() if hasattr(self, 'relay_event_filter_var') else 'All'
+        event_id = self._relay_event_map.get(event_filter) if hasattr(self, '_relay_event_map') else None
+
+        relay_teams = get_relay_teams(self.db_conn, event_id=event_id)
+
+        for rt in relay_teams:
+            legs = rt['legs']
+            leg_names = [''] * 4
+            for leg in legs:
+                pos = leg['order_position'] - 1
+                if 0 <= pos < 4:
+                    split_str = f" ({seconds_to_time_str(leg['split_time'])})" if leg['split_time'] else ""
+                    leg_names[pos] = f"{leg['swimmer_name']}{split_str}"
+
+            seed_str = seconds_to_time_str(rt['seed_time'])
+            final_str = seconds_to_time_str(rt['finish_time'])
+            if rt['dq']:
+                final_str = f"DQ ({rt['dq_code']})" if rt['dq_code'] else "DQ"
+            place_str = str(rt['place']) if rt['place'] else ""
+            pts_str = f"{rt['points']:.0f}" if rt['points'] else ""
+
+            self.relays_tree.insert('', 'end', values=(
+                rt['event_number'], rt['team_code'], rt['relay_letter'],
+                leg_names[0], leg_names[1], leg_names[2], leg_names[3],
+                seed_str, final_str, place_str, pts_str
+            ), iid=str(rt['id']))
+
+    def add_relay_team_dialog(self):
+        """Show dialog to create a new relay team."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Relay Team")
+        dialog.geometry("500x400")
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(fill='both', expand=True)
+
+        cursor = self.db_conn.cursor()
+
+        # Relay events
+        cursor.execute("SELECT id, number, name FROM events WHERE is_relay = 1 ORDER BY number")
+        relay_events = cursor.fetchall()
+        if not relay_events:
+            ttk.Label(frame, text="No relay events defined.\nAdd relay events first (check 'Relay' when adding).",
+                      font=('Arial', 11)).pack(expand=True)
+            ttk.Button(frame, text="Close", command=dialog.destroy).pack(pady=10)
+            return
+
+        event_dict = {f"#{e[1]}: {e[2]}": e[0] for e in relay_events}
+
+        # Teams
+        cursor.execute("SELECT id, team_code, team_name FROM teams ORDER BY team_code")
+        teams = cursor.fetchall()
+        team_dict = {f"{t[1]} - {t[2]}": t[0] for t in teams}
+
+        ttk.Label(frame, text="Relay Event:").grid(row=0, column=0, sticky='w', pady=5)
+        event_var = tk.StringVar()
+        ttk.Combobox(frame, textvariable=event_var, values=list(event_dict.keys()),
+                     state='readonly', width=35).grid(row=0, column=1, pady=5)
+
+        ttk.Label(frame, text="Team:").grid(row=1, column=0, sticky='w', pady=5)
+        team_var = tk.StringVar()
+        ttk.Combobox(frame, textvariable=team_var, values=list(team_dict.keys()),
+                     state='readonly', width=35).grid(row=1, column=1, pady=5)
+
+        ttk.Label(frame, text="Relay Letter:").grid(row=2, column=0, sticky='w', pady=5)
+        letter_var = tk.StringVar(value='A')
+        ttk.Combobox(frame, textvariable=letter_var,
+                     values=['A', 'B', 'C', 'D', 'E'],
+                     state='readonly', width=35).grid(row=2, column=1, pady=5)
+
+        ttk.Label(frame, text="Seed Time (MM:SS.HH or NT):").grid(row=3, column=0, sticky='w', pady=5)
+        time_var = tk.StringVar(value="NT")
+        ttk.Entry(frame, textvariable=time_var, width=37).grid(row=3, column=1, pady=5)
+
+        # Swimmer selection for legs
+        ttk.Label(frame, text="\nAssign Relay Legs:", font=('Arial', 10, 'bold')).grid(
+            row=4, column=0, columnspan=2, sticky='w', pady=(10, 5))
+
+        leg_vars = []
+        swimmer_combos = []
+
+        def update_swimmer_list(*args):
+            """Update swimmer options when team changes."""
+            team_key = team_var.get()
+            if not team_key or team_key not in team_dict:
+                return
+            tid = team_dict[team_key]
+            swimmers = get_team_swimmers(self.db_conn, tid)
+            swimmer_options = [f"{s['name']} (ID:{s['id']})" for s in swimmers]
+            self._relay_swimmer_map = {f"{s['name']} (ID:{s['id']})": s['id'] for s in swimmers}
+            for combo in swimmer_combos:
+                combo['values'] = ['(none)'] + swimmer_options
+
+        for i in range(4):
+            ttk.Label(frame, text=f"Leg {i+1}:").grid(row=5+i, column=0, sticky='w', pady=2)
+            var = tk.StringVar(value='(none)')
+            combo = ttk.Combobox(frame, textvariable=var, state='readonly', width=35)
+            combo.grid(row=5+i, column=1, pady=2)
+            leg_vars.append(var)
+            swimmer_combos.append(combo)
+
+        team_var.trace_add('write', update_swimmer_list)
+
+        def save_relay():
+            try:
+                event_key = event_var.get()
+                team_key = team_var.get()
+                if not event_key or not team_key:
+                    messagebox.showwarning("Missing Info", "Select event and team")
+                    return
+
+                eid = event_dict[event_key]
+                tid = team_dict[team_key]
+                seed_time = time_to_seconds(time_var.get())
+
+                rt_id = create_relay_team(self.db_conn, eid, tid,
+                                          relay_letter=letter_var.get(),
+                                          seed_time=seed_time)
+
+                # Set legs
+                legs = []
+                for i, var in enumerate(leg_vars):
+                    val = var.get()
+                    if val != '(none)' and val in self._relay_swimmer_map:
+                        legs.append({
+                            'leg_number': i + 1,
+                            'swimmer_id': self._relay_swimmer_map[val],
+                            'order_position': i + 1,
+                        })
+
+                if legs:
+                    set_relay_legs(self.db_conn, rt_id, legs)
+
+                save_undo_point(self.db_conn, 'insert', 'relay_teams', rt_id,
+                               description=f"Added relay {team_key} '{letter_var.get()}' in event {event_key}")
+                messagebox.showinfo("Success", f"Relay team created (ID: {rt_id})")
+                dialog.destroy()
+                self.refresh_relays_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to create relay: {e}")
+
+        ttk.Button(frame, text="Create Relay Team", command=save_relay).grid(
+            row=9, column=0, columnspan=2, pady=15)
+
+    def edit_relay_legs_dialog(self):
+        """Edit leg assignments for the selected relay team."""
+        if not hasattr(self, 'relays_tree'):
+            return
+        selection = self.relays_tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Select a relay team to edit legs")
+            return
+
+        relay_team_id = int(selection[0])
+        relay_teams = get_relay_teams(self.db_conn)
+        rt = next((r for r in relay_teams if r['id'] == relay_team_id), None)
+        if not rt:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Edit Legs - {rt['team_code']} '{rt['relay_letter']}' (Event #{rt['event_number']})")
+        dialog.geometry("500x350")
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(fill='both', expand=True)
+
+        # Get team swimmers
+        swimmers = get_team_swimmers(self.db_conn, rt['team_id'])
+        swimmer_options = [f"{s['name']} (ID:{s['id']})" for s in swimmers]
+        swimmer_map = {f"{s['name']} (ID:{s['id']})": s['id'] for s in swimmers}
+        # Reverse map: id -> display string
+        id_to_display = {s['id']: f"{s['name']} (ID:{s['id']})" for s in swimmers}
+
+        existing_legs = rt['legs']
+
+        ttk.Label(frame, text=f"Team: {rt['team_code']} - {rt['team_name']}",
+                  font=('Arial', 11, 'bold')).grid(row=0, column=0, columnspan=2, pady=(0, 10))
+
+        leg_vars = []
+        split_vars = []
+        for i in range(4):
+            ttk.Label(frame, text=f"Leg {i+1}:").grid(row=i+1, column=0, sticky='w', pady=3)
+
+            # Pre-select existing leg swimmer
+            current = '(none)'
+            current_split = ''
+            for leg in existing_legs:
+                if leg['order_position'] == i + 1:
+                    display = id_to_display.get(leg['swimmer_id'], '(none)')
+                    if display in swimmer_map:
+                        current = display
+                    if leg['split_time'] is not None:
+                        current_split = seconds_to_time_str(leg['split_time'])
+                    break
+
+            var = tk.StringVar(value=current)
+            combo = ttk.Combobox(frame, textvariable=var,
+                                 values=['(none)'] + swimmer_options,
+                                 state='readonly', width=28)
+            combo.grid(row=i+1, column=1, pady=3)
+            leg_vars.append(var)
+
+            ttk.Label(frame, text="Split:").grid(row=i+1, column=2, padx=(10, 2))
+            split_var = tk.StringVar(value=current_split)
+            ttk.Entry(frame, textvariable=split_var, width=10).grid(row=i+1, column=3, pady=3)
+            split_vars.append(split_var)
+
+        def save_legs():
+            try:
+                legs = []
+                for i, (var, split_var) in enumerate(zip(leg_vars, split_vars)):
+                    val = var.get()
+                    if val != '(none)' and val in swimmer_map:
+                        split_time = time_to_seconds(split_var.get()) if split_var.get() else None
+                        legs.append({
+                            'leg_number': i + 1,
+                            'swimmer_id': swimmer_map[val],
+                            'order_position': i + 1,
+                            'split_time': split_time,
+                        })
+                set_relay_legs(self.db_conn, relay_team_id, legs)
+                messagebox.showinfo("Success", "Legs updated")
+                dialog.destroy()
+                self.refresh_relays_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to update legs: {e}")
+
+        ttk.Button(frame, text="Save Legs", command=save_legs).grid(
+            row=5, column=0, columnspan=4, pady=15)
+
+    def relay_results_dialog(self):
+        """Show dialog to enter results for relay events."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Enter Relay Results")
+        dialog.geometry("700x550")
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding="10")
+        frame.pack(fill='both', expand=True)
+
+        # Event selector (relay events only)
+        top = ttk.Frame(frame)
+        top.pack(fill='x', pady=5)
+
+        ttk.Label(top, text="Relay Event:").pack(side='left', padx=2)
+        cursor = self.db_conn.cursor()
+        cursor.execute("SELECT id, number, name FROM events WHERE is_relay = 1 ORDER BY number")
+        events = cursor.fetchall()
+        if not events:
+            ttk.Label(frame, text="No relay events found.").pack(expand=True)
+            ttk.Button(frame, text="Close", command=dialog.destroy).pack(pady=10)
+            return
+
+        event_dict = {f"#{e[1]}: {e[2]}": e[0] for e in events}
+        event_var = tk.StringVar()
+        event_combo = ttk.Combobox(top, textvariable=event_var,
+                                   values=list(event_dict.keys()),
+                                   state='readonly', width=40)
+        event_combo.pack(side='left', padx=5)
+
+        # Relay results frame
+        results_frame = ttk.LabelFrame(frame, text="Relay Results", padding="10")
+        results_frame.pack(fill='both', expand=True, pady=10)
+
+        relay_widgets = {}
+
+        def load_relays(*args):
+            """Load relay teams for the selected event."""
+            for w in results_frame.winfo_children():
+                w.destroy()
+            relay_widgets.clear()
+
+            event_key = event_var.get()
+            if not event_key:
+                return
+            eid = event_dict[event_key]
+
+            rts = get_relay_teams(self.db_conn, event_id=eid)
+            if not rts:
+                ttk.Label(results_frame, text="No relay teams for this event.").pack()
+                return
+
+            # Headers
+            headers = ['Lane', 'Team', 'Letter', 'Seed', 'Finish Time', 'DQ', 'DQ Code']
+            for c, h in enumerate(headers):
+                ttk.Label(results_frame, text=h, font=('Arial', 9, 'bold')).grid(
+                    row=0, column=c, padx=3, pady=2)
+
+            for i, rt in enumerate(rts, 1):
+                lane_str = str(rt['lane']) if rt['lane'] else '-'
+                ttk.Label(results_frame, text=lane_str).grid(row=i, column=0, padx=3, pady=2)
+                ttk.Label(results_frame, text=rt['team_code']).grid(row=i, column=1, padx=3, pady=2)
+                ttk.Label(results_frame, text=rt['relay_letter']).grid(row=i, column=2, padx=3, pady=2)
+                ttk.Label(results_frame, text=seconds_to_time_str(rt['seed_time'])).grid(
+                    row=i, column=3, padx=3, pady=2)
+
+                time_entry = ttk.Entry(results_frame, width=12)
+                time_entry.grid(row=i, column=4, padx=3, pady=2)
+                if rt['finish_time'] is not None:
+                    time_entry.insert(0, seconds_to_time_str(rt['finish_time']))
+
+                dq_var = tk.BooleanVar(value=bool(rt['dq']))
+                ttk.Checkbutton(results_frame, variable=dq_var).grid(row=i, column=5, padx=3, pady=2)
+
+                dq_code_var = tk.StringVar(value=rt['dq_code'] or '')
+                ttk.Combobox(results_frame, textvariable=dq_code_var,
+                             values=list(DQ_CODES.keys()), width=5).grid(row=i, column=6, padx=3, pady=2)
+
+                relay_widgets[rt['id']] = {
+                    'time_entry': time_entry,
+                    'dq_var': dq_var,
+                    'dq_code_var': dq_code_var,
+                }
+
+        event_combo.bind('<<ComboboxSelected>>', load_relays)
+
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill='x', pady=5)
+
+        def save_relay_results():
+            event_key = event_var.get()
+            if not event_key:
+                return
+            eid = event_dict[event_key]
+            saved = 0
+
+            for rt_id, widgets in relay_widgets.items():
+                time_str = widgets['time_entry'].get().strip()
+                finish_time = time_to_seconds(time_str) if time_str else None
+                dq = widgets['dq_var'].get()
+                dq_code = widgets['dq_code_var'].get() or None
+
+                save_relay_result(self.db_conn, rt_id,
+                                  finish_time=finish_time, dq=dq, dq_code=dq_code)
+                saved += 1
+
+            # Calculate places and points
+            scoring_type = get_meet_setting(self.db_conn, 'scoring_type', 'dual')
+            calculate_relay_places(self.db_conn, eid)
+            assign_relay_points(self.db_conn, eid, scoring_type)
+
+            messagebox.showinfo("Results Saved", f"Saved results for {saved} relay teams.")
+            self.refresh_relays_list()
+            if hasattr(self, 'scores_tree'):
+                self.refresh_scores()
+
+        ttk.Button(btn_frame, text="Save Results", command=save_relay_results).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Close", command=dialog.destroy).pack(side='right', padx=5)
+
+    def delete_selected_relay(self):
+        """Delete selected relay team."""
+        if not hasattr(self, 'relays_tree'):
+            return
+        selection = self.relays_tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Select a relay team to delete")
+            return
+
+        if messagebox.askyesno("Confirm", "Delete this relay team and all leg assignments?"):
+            try:
+                rt_id = int(selection[0])
+                delete_relay_team(self.db_conn, rt_id)
+                self.refresh_relays_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete relay: {e}")
 
     # ─── Results Tab ───────────────────────────────────────────────────
 

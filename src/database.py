@@ -1231,6 +1231,232 @@ def mark_announcement_displayed(conn: sqlite3.Connection, announcement_id: int):
     conn.commit()
 
 
+# ─── Relay Management ─────────────────────────────────────────────────
+
+def create_relay_team(conn: sqlite3.Connection, event_id: int, team_id: int,
+                      relay_letter: str = 'A', seed_time: float = None) -> int:
+    """
+    Create a relay team entry for a relay event.
+
+    Args:
+        event_id: Must be a relay event (is_relay=1)
+        team_id: Team that this relay belongs to
+        relay_letter: A, B, C etc. for multiple relays per team
+        seed_time: Seed time in seconds
+
+    Returns:
+        relay_team_id
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO relay_teams (event_id, team_id, relay_letter, seed_time)
+           VALUES (?, ?, ?, ?)""",
+        (event_id, team_id, relay_letter, seed_time)
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_relay_teams(conn: sqlite3.Connection, event_id: int = None,
+                    team_id: int = None) -> List[Dict]:
+    """
+    Get relay teams, optionally filtered by event and/or team.
+
+    Returns list of dicts with relay team info including leg swimmers.
+    """
+    cursor = conn.cursor()
+    query = """
+        SELECT rt.id, rt.event_id, ev.number, ev.name, rt.team_id, t.team_code,
+               t.team_name, rt.relay_letter, rt.seed_time, rt.finish_time,
+               rt.place, rt.points, rt.dq, rt.dq_code, rt.heat_id, rt.lane
+        FROM relay_teams rt
+        JOIN events ev ON rt.event_id = ev.id
+        JOIN teams t ON rt.team_id = t.id
+        WHERE 1=1
+    """
+    params = []
+    if event_id is not None:
+        query += " AND rt.event_id = ?"
+        params.append(event_id)
+    if team_id is not None:
+        query += " AND rt.team_id = ?"
+        params.append(team_id)
+    query += " ORDER BY ev.number, t.team_code, rt.relay_letter"
+
+    cursor.execute(query, params)
+    relay_teams = []
+    for row in cursor.fetchall():
+        rt = {
+            'id': row[0], 'event_id': row[1], 'event_number': row[2],
+            'event_name': row[3], 'team_id': row[4], 'team_code': row[5],
+            'team_name': row[6], 'relay_letter': row[7], 'seed_time': row[8],
+            'finish_time': row[9], 'place': row[10], 'points': row[11],
+            'dq': row[12], 'dq_code': row[13], 'heat_id': row[14], 'lane': row[15],
+        }
+        # Fetch legs
+        rt['legs'] = get_relay_legs(conn, row[0])
+        relay_teams.append(rt)
+    return relay_teams
+
+
+def update_relay_team(conn: sqlite3.Connection, relay_team_id: int,
+                      seed_time: float = None, relay_letter: str = None):
+    """Update relay team seed time or letter."""
+    cursor = conn.cursor()
+    if seed_time is not None:
+        cursor.execute("UPDATE relay_teams SET seed_time = ? WHERE id = ?",
+                       (seed_time, relay_team_id))
+    if relay_letter is not None:
+        cursor.execute("UPDATE relay_teams SET relay_letter = ? WHERE id = ?",
+                       (relay_letter, relay_team_id))
+    conn.commit()
+
+
+def delete_relay_team(conn: sqlite3.Connection, relay_team_id: int):
+    """Delete a relay team and its leg assignments."""
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM relay_splits WHERE relay_team_id = ?", (relay_team_id,))
+    cursor.execute("DELETE FROM relay_teams WHERE id = ?", (relay_team_id,))
+    conn.commit()
+
+
+def set_relay_legs(conn: sqlite3.Connection, relay_team_id: int,
+                   legs: List[Dict]):
+    """
+    Set the swimmers for a relay team.
+
+    Args:
+        relay_team_id: The relay team to set legs for
+        legs: List of dicts with keys: leg_number (1-4), swimmer_id, order_position (1-4)
+              Example: [{'leg_number': 1, 'swimmer_id': 5, 'order_position': 1}, ...]
+    """
+    cursor = conn.cursor()
+    # Clear existing legs
+    cursor.execute("DELETE FROM relay_splits WHERE relay_team_id = ?", (relay_team_id,))
+
+    for leg in legs:
+        cursor.execute(
+            """INSERT INTO relay_splits (relay_team_id, leg_number, swimmer_id,
+                   split_time, order_position)
+               VALUES (?, ?, ?, ?, ?)""",
+            (relay_team_id, leg['leg_number'], leg['swimmer_id'],
+             leg.get('split_time'), leg['order_position'])
+        )
+    conn.commit()
+
+
+def get_relay_legs(conn: sqlite3.Connection, relay_team_id: int) -> List[Dict]:
+    """Get the leg assignments for a relay team."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT rs.id, rs.leg_number, rs.swimmer_id, s.name, rs.split_time,
+               rs.order_position
+        FROM relay_splits rs
+        JOIN swimmers s ON rs.swimmer_id = s.id
+        WHERE rs.relay_team_id = ?
+        ORDER BY rs.order_position
+    """, (relay_team_id,))
+
+    return [
+        {'id': r[0], 'leg_number': r[1], 'swimmer_id': r[2],
+         'swimmer_name': r[3], 'split_time': r[4], 'order_position': r[5]}
+        for r in cursor.fetchall()
+    ]
+
+
+def save_relay_result(conn: sqlite3.Connection, relay_team_id: int,
+                      finish_time: float = None, dq: bool = False,
+                      dq_code: str = None, splits: List[Dict] = None) -> int:
+    """
+    Save result for a relay team.
+
+    Args:
+        relay_team_id: The relay team
+        finish_time: Final time in seconds
+        dq: Whether the relay was DQ'd
+        dq_code: DQ code if applicable
+        splits: Optional list of dicts with leg split times:
+                [{'order_position': 1, 'split_time': 25.30}, ...]
+
+    Returns:
+        relay_team_id
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE relay_teams SET finish_time = ?, dq = ?, dq_code = ?
+        WHERE id = ?
+    """, (finish_time, int(dq), dq_code, relay_team_id))
+
+    # Update split times if provided
+    if splits:
+        for split in splits:
+            cursor.execute("""
+                UPDATE relay_splits SET split_time = ?
+                WHERE relay_team_id = ? AND order_position = ?
+            """, (split['split_time'], relay_team_id, split['order_position']))
+
+    conn.commit()
+    return relay_team_id
+
+
+def calculate_relay_places(conn: sqlite3.Connection, event_id: int):
+    """Calculate places for relay teams in an event."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, finish_time, dq
+        FROM relay_teams
+        WHERE event_id = ?
+        ORDER BY
+            CASE WHEN dq = 1 OR finish_time IS NULL THEN 1 ELSE 0 END,
+            finish_time ASC
+    """, (event_id,))
+
+    place = 1
+    for rt_id, finish_time, dq in cursor.fetchall():
+        if dq or finish_time is None:
+            cursor.execute("UPDATE relay_teams SET place = NULL WHERE id = ?", (rt_id,))
+        else:
+            cursor.execute("UPDATE relay_teams SET place = ? WHERE id = ?", (place, rt_id))
+            place += 1
+    conn.commit()
+
+
+def assign_relay_points(conn: sqlite3.Connection, event_id: int,
+                        scoring_type: str = 'dual'):
+    """Assign points to relay teams based on place and scoring type."""
+    scoring = SCORING_TABLES.get(scoring_type, SCORING_TABLES['dual'])
+    point_table = scoring['relay']
+
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, place FROM relay_teams
+        WHERE event_id = ? AND place IS NOT NULL
+        ORDER BY place
+    """, (event_id,))
+
+    for rt_id, place in cursor.fetchall():
+        points = point_table[place - 1] if place <= len(point_table) else 0
+        cursor.execute("UPDATE relay_teams SET points = ? WHERE id = ?", (points, rt_id))
+    conn.commit()
+
+
+def get_team_swimmers(conn: sqlite3.Connection, team_id: int,
+                      gender: str = None) -> List[Dict]:
+    """Get swimmers belonging to a team, optionally filtered by gender."""
+    cursor = conn.cursor()
+    query = "SELECT id, name, age, gender FROM swimmers WHERE team_id = ?"
+    params = [team_id]
+    if gender:
+        query += " AND gender = ?"
+        params.append(gender)
+    query += " ORDER BY name"
+    cursor.execute(query, params)
+    return [
+        {'id': r[0], 'name': r[1], 'age': r[2], 'gender': r[3]}
+        for r in cursor.fetchall()
+    ]
+
+
 # ─── Check-in System ──────────────────────────────────────────────────
 
 def check_in_swimmer(conn: sqlite3.Connection, swimmer_id: int) -> bool:

@@ -19,14 +19,20 @@ def apply_seeding(conn: sqlite3.Connection, event_id: int, method: str = 'circle
         Number of heats created
     """
     cursor = conn.cursor()
-    
+
+    # Check if this is a relay event
+    cursor.execute("SELECT is_relay FROM events WHERE id = ?", (event_id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        return apply_relay_seeding(conn, event_id, method, lanes)
+
     # Get all entries for this event, ordered by seed time (fastest first, NT last)
     cursor.execute("""
         SELECT e.id, e.swimmer_id, e.seed_time, s.name
         FROM entries e
         JOIN swimmers s ON e.swimmer_id = s.id
         WHERE e.event_id = ?
-        ORDER BY 
+        ORDER BY
             CASE WHEN e.seed_time IS NULL THEN 1 ELSE 0 END,
             e.seed_time ASC
     """, (event_id,))
@@ -193,6 +199,102 @@ def _get_lane_order(total_lanes: int, swimmers_in_heat: int) -> List[int]:
     
     # Only return lanes needed for this heat
     return base_order[:swimmers_in_heat]
+
+def apply_relay_seeding(conn: sqlite3.Connection, event_id: int,
+                        method: str = 'circle', lanes: int = 6) -> int:
+    """
+    Seed a relay event using relay_teams table.
+
+    Args:
+        conn: Database connection
+        event_id: Relay event to seed
+        method: 'circle' or 'straight'
+        lanes: Number of lanes
+
+    Returns:
+        Number of heats created
+    """
+    cursor = conn.cursor()
+
+    # Get all relay teams for this event, ordered by seed time
+    cursor.execute("""
+        SELECT id, seed_time
+        FROM relay_teams
+        WHERE event_id = ?
+        ORDER BY
+            CASE WHEN seed_time IS NULL THEN 1 ELSE 0 END,
+            seed_time ASC
+    """, (event_id,))
+
+    relay_entries = cursor.fetchall()
+    if not relay_entries:
+        return 0
+
+    # Clear existing heats for this event
+    cursor.execute("DELETE FROM heats WHERE event_id = ?", (event_id,))
+
+    num_entries = len(relay_entries)
+    num_heats = (num_entries + lanes - 1) // lanes
+
+    # Build entries in same format as individual: (relay_team_id, None, seed_time, '')
+    entries = [(rt_id, None, seed_time, '') for rt_id, seed_time in relay_entries]
+
+    if method == 'straight':
+        heat_assignments = _straight_seeding(entries, num_heats, lanes)
+    else:
+        heat_assignments = _circle_seeding(entries, num_heats, lanes)
+
+    # Create heats and assign relay teams to lanes
+    for heat_num in range(1, num_heats + 1):
+        cursor.execute(
+            "INSERT INTO heats (event_id, heat_number) VALUES (?, ?)",
+            (event_id, heat_num)
+        )
+        heat_id = cursor.lastrowid
+
+        for lane, relay_team_id in heat_assignments[heat_num - 1]:
+            if relay_team_id is not None:
+                cursor.execute(
+                    "UPDATE relay_teams SET heat_id = ?, lane = ? WHERE id = ?",
+                    (heat_id, lane, relay_team_id)
+                )
+
+    conn.commit()
+    return num_heats
+
+
+def get_relay_heat_sheet(conn: sqlite3.Connection, event_id: int) -> List[dict]:
+    """
+    Get heat sheet data for a relay event.
+
+    Returns list of dicts with heat/lane info for relay teams.
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT h.heat_number, rt.lane, t.team_code, t.team_name,
+               rt.relay_letter, rt.seed_time, rt.id
+        FROM relay_teams rt
+        JOIN heats h ON rt.heat_id = h.id
+        JOIN teams t ON rt.team_id = t.id
+        WHERE rt.event_id = ? AND rt.heat_id IS NOT NULL
+        ORDER BY h.heat_number, rt.lane
+    """, (event_id,))
+
+    results = []
+    for row in cursor.fetchall():
+        from src.hy3_parser import seconds_to_time_str
+        results.append({
+            'heat': row[0],
+            'lane': row[1],
+            'team_code': row[2],
+            'team_name': row[3],
+            'relay_letter': row[4],
+            'name': f"{row[2]} '{row[4]}'",
+            'seed_time': seconds_to_time_str(row[5]),
+            'relay_team_id': row[6],
+        })
+    return results
+
 
 def get_heat_sheet(conn: sqlite3.Connection, event_id: int) -> List[dict]:
     """

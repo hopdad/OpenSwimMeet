@@ -25,9 +25,12 @@ from src.database import (
     check_in_swimmer, check_out_swimmer, get_check_in_status,
     add_announcement, get_announcements, mark_announcement_displayed,
     get_validation_rule, check_records,
+    create_relay_team, get_relay_teams, update_relay_team, delete_relay_team,
+    set_relay_legs, get_relay_legs, save_relay_result,
+    calculate_relay_places, assign_relay_points, get_team_swimmers,
     SCORING_TABLES, DQ_CODES, SCHEMA_VERSION,
 )
-from src.seeding import apply_seeding, get_heat_sheet
+from src.seeding import apply_seeding, get_heat_sheet, apply_relay_seeding, get_relay_heat_sheet
 
 
 class DBWrapper:
@@ -715,6 +718,334 @@ class TestDQCodes:
         for code, desc in DQ_CODES.items():
             assert isinstance(code, str) and len(code) == 2
             assert isinstance(desc, str) and len(desc) > 0
+
+
+# ─── Relay Fixture ────────────────────────────────────────────────────
+
+@pytest.fixture
+def relay_db(populated_db):
+    """Extend populated_db with relay events and teams."""
+    cursor = populated_db.cursor()
+
+    # Add relay events
+    cursor.execute(
+        "INSERT INTO events (number, name, distance, stroke, gender, is_relay) VALUES (?,?,?,?,?,?)",
+        (5, 'Boys 200 Free Relay', 200, 'FREE', 'M', 1))
+    relay_event_id = cursor.lastrowid
+
+    cursor.execute(
+        "INSERT INTO events (number, name, distance, stroke, gender, is_relay) VALUES (?,?,?,?,?,?)",
+        (6, 'Girls 200 Medley Relay', 200, 'IM', 'F', 1))
+
+    # Get team IDs
+    cursor.execute("SELECT id FROM teams WHERE team_code = 'SHRK'")
+    shrk_id = cursor.fetchone()[0]
+    cursor.execute("SELECT id FROM teams WHERE team_code = 'DOLP'")
+    dolp_id = cursor.fetchone()[0]
+
+    populated_db.commit()
+    populated_db.relay_event_id = relay_event_id
+    populated_db.shrk_id = shrk_id
+    populated_db.dolp_id = dolp_id
+    return populated_db
+
+
+# ─── Relay CRUD Tests ─────────────────────────────────────────────────
+
+class TestRelayCRUD:
+    def test_create_relay_team(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, relay_letter='A', seed_time=95.50)
+        assert rt_id > 0
+
+        rts = get_relay_teams(relay_db, event_id=relay_db.relay_event_id)
+        assert len(rts) == 1
+        assert rts[0]['team_code'] == 'SHRK'
+        assert rts[0]['relay_letter'] == 'A'
+        assert rts[0]['seed_time'] == 95.50
+
+    def test_create_multiple_relay_teams(self, relay_db):
+        create_relay_team(relay_db, relay_db.relay_event_id, relay_db.shrk_id, 'A', 95.50)
+        create_relay_team(relay_db, relay_db.relay_event_id, relay_db.shrk_id, 'B', 102.00)
+        create_relay_team(relay_db, relay_db.relay_event_id, relay_db.dolp_id, 'A', 97.20)
+
+        rts = get_relay_teams(relay_db, event_id=relay_db.relay_event_id)
+        assert len(rts) == 3
+
+    def test_get_relay_teams_by_team(self, relay_db):
+        create_relay_team(relay_db, relay_db.relay_event_id, relay_db.shrk_id, 'A')
+        create_relay_team(relay_db, relay_db.relay_event_id, relay_db.dolp_id, 'A')
+
+        rts = get_relay_teams(relay_db, team_id=relay_db.shrk_id)
+        assert len(rts) == 1
+        assert rts[0]['team_code'] == 'SHRK'
+
+    def test_update_relay_team(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A', 95.50)
+        update_relay_team(relay_db, rt_id, seed_time=93.00, relay_letter='B')
+
+        rts = get_relay_teams(relay_db, event_id=relay_db.relay_event_id)
+        assert rts[0]['seed_time'] == 93.00
+        assert rts[0]['relay_letter'] == 'B'
+
+    def test_delete_relay_team(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A')
+        delete_relay_team(relay_db, rt_id)
+
+        rts = get_relay_teams(relay_db, event_id=relay_db.relay_event_id)
+        assert len(rts) == 0
+
+
+# ─── Relay Legs Tests ─────────────────────────────────────────────────
+
+class TestRelayLegs:
+    def test_set_and_get_legs(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A')
+        sids = relay_db.swimmer_ids
+        # Use SHRK swimmers: Smith (0), Doe (1), Lee (4)
+        legs = [
+            {'leg_number': 1, 'swimmer_id': sids[0], 'order_position': 1},
+            {'leg_number': 2, 'swimmer_id': sids[1], 'order_position': 2},
+            {'leg_number': 3, 'swimmer_id': sids[4], 'order_position': 3},
+        ]
+        set_relay_legs(relay_db, rt_id, legs)
+
+        result = get_relay_legs(relay_db, rt_id)
+        assert len(result) == 3
+        assert result[0]['swimmer_name'] == 'Smith, John'
+        assert result[0]['order_position'] == 1
+        assert result[1]['order_position'] == 2
+
+    def test_replace_legs(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A')
+        sids = relay_db.swimmer_ids
+
+        # Set initial legs
+        set_relay_legs(relay_db, rt_id, [
+            {'leg_number': 1, 'swimmer_id': sids[0], 'order_position': 1},
+        ])
+        assert len(get_relay_legs(relay_db, rt_id)) == 1
+
+        # Replace with new legs
+        set_relay_legs(relay_db, rt_id, [
+            {'leg_number': 1, 'swimmer_id': sids[0], 'order_position': 1},
+            {'leg_number': 2, 'swimmer_id': sids[1], 'order_position': 2},
+        ])
+        assert len(get_relay_legs(relay_db, rt_id)) == 2
+
+    def test_legs_with_split_times(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A')
+        sids = relay_db.swimmer_ids
+        legs = [
+            {'leg_number': 1, 'swimmer_id': sids[0], 'order_position': 1, 'split_time': 24.50},
+            {'leg_number': 2, 'swimmer_id': sids[1], 'order_position': 2, 'split_time': 26.30},
+        ]
+        set_relay_legs(relay_db, rt_id, legs)
+
+        result = get_relay_legs(relay_db, rt_id)
+        assert result[0]['split_time'] == 24.50
+        assert result[1]['split_time'] == 26.30
+
+    def test_legs_included_in_relay_teams(self, relay_db):
+        """Verify get_relay_teams includes leg data."""
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A')
+        sids = relay_db.swimmer_ids
+        set_relay_legs(relay_db, rt_id, [
+            {'leg_number': 1, 'swimmer_id': sids[0], 'order_position': 1},
+            {'leg_number': 2, 'swimmer_id': sids[4], 'order_position': 2},
+        ])
+
+        rts = get_relay_teams(relay_db, event_id=relay_db.relay_event_id)
+        assert len(rts[0]['legs']) == 2
+
+    def test_delete_relay_clears_legs(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A')
+        sids = relay_db.swimmer_ids
+        set_relay_legs(relay_db, rt_id, [
+            {'leg_number': 1, 'swimmer_id': sids[0], 'order_position': 1},
+        ])
+        delete_relay_team(relay_db, rt_id)
+
+        cursor = relay_db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM relay_splits WHERE relay_team_id = ?", (rt_id,))
+        assert cursor.fetchone()[0] == 0
+
+
+# ─── Relay Results Tests ──────────────────────────────────────────────
+
+class TestRelayResults:
+    def test_save_relay_result(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A', seed_time=95.50)
+        save_relay_result(relay_db, rt_id, finish_time=94.20)
+
+        rts = get_relay_teams(relay_db, event_id=relay_db.relay_event_id)
+        assert rts[0]['finish_time'] == 94.20
+        assert rts[0]['dq'] == 0
+
+    def test_save_relay_result_dq(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A')
+        save_relay_result(relay_db, rt_id, dq=True, dq_code='FA')
+
+        rts = get_relay_teams(relay_db, event_id=relay_db.relay_event_id)
+        assert rts[0]['dq'] == 1
+        assert rts[0]['dq_code'] == 'FA'
+
+    def test_save_relay_result_with_splits(self, relay_db):
+        rt_id = create_relay_team(relay_db, relay_db.relay_event_id,
+                                   relay_db.shrk_id, 'A')
+        sids = relay_db.swimmer_ids
+        set_relay_legs(relay_db, rt_id, [
+            {'leg_number': 1, 'swimmer_id': sids[0], 'order_position': 1},
+            {'leg_number': 2, 'swimmer_id': sids[4], 'order_position': 2},
+        ])
+
+        save_relay_result(relay_db, rt_id, finish_time=50.00,
+                         splits=[
+                             {'order_position': 1, 'split_time': 24.50},
+                             {'order_position': 2, 'split_time': 25.50},
+                         ])
+
+        legs = get_relay_legs(relay_db, rt_id)
+        assert legs[0]['split_time'] == 24.50
+        assert legs[1]['split_time'] == 25.50
+
+    def test_calculate_relay_places(self, relay_db):
+        eid = relay_db.relay_event_id
+        rt1 = create_relay_team(relay_db, eid, relay_db.shrk_id, 'A')
+        rt2 = create_relay_team(relay_db, eid, relay_db.dolp_id, 'A')
+        rt3 = create_relay_team(relay_db, eid, relay_db.shrk_id, 'B')
+
+        save_relay_result(relay_db, rt1, finish_time=95.00)
+        save_relay_result(relay_db, rt2, finish_time=97.50)
+        save_relay_result(relay_db, rt3, dq=True, dq_code='FA')
+
+        calculate_relay_places(relay_db, eid)
+
+        rts = get_relay_teams(relay_db, event_id=eid)
+        places = {r['id']: r['place'] for r in rts}
+        assert places[rt1] == 1
+        assert places[rt2] == 2
+        assert places[rt3] is None  # DQ'd
+
+    def test_assign_relay_points_dual(self, relay_db):
+        eid = relay_db.relay_event_id
+        rt1 = create_relay_team(relay_db, eid, relay_db.shrk_id, 'A')
+        rt2 = create_relay_team(relay_db, eid, relay_db.dolp_id, 'A')
+
+        save_relay_result(relay_db, rt1, finish_time=95.00)
+        save_relay_result(relay_db, rt2, finish_time=97.50)
+
+        calculate_relay_places(relay_db, eid)
+        assign_relay_points(relay_db, eid, 'dual')
+
+        rts = get_relay_teams(relay_db, event_id=eid)
+        points = {r['id']: r['points'] for r in rts}
+        # Dual relay scoring: [7, 0]
+        assert points[rt1] == 7
+        assert points[rt2] == 0
+
+    def test_relay_points_in_team_scores(self, relay_db):
+        """Relay points should appear in team scores."""
+        eid = relay_db.relay_event_id
+        rt1 = create_relay_team(relay_db, eid, relay_db.shrk_id, 'A')
+        rt2 = create_relay_team(relay_db, eid, relay_db.dolp_id, 'A')
+
+        save_relay_result(relay_db, rt1, finish_time=95.00)
+        save_relay_result(relay_db, rt2, finish_time=97.50)
+
+        calculate_relay_places(relay_db, eid)
+        assign_relay_points(relay_db, eid, 'dual')
+
+        scores = get_team_scores(relay_db, 'dual')
+        shrk_score = next(s for s in scores if s['team_code'] == 'SHRK')
+        assert shrk_score['relay'] == 7
+
+
+# ─── Relay Seeding Tests ─────────────────────────────────────────────
+
+class TestRelaySeeding:
+    def test_seed_relay_event(self, relay_db):
+        eid = relay_db.relay_event_id
+        create_relay_team(relay_db, eid, relay_db.shrk_id, 'A', 95.00)
+        create_relay_team(relay_db, eid, relay_db.dolp_id, 'A', 97.50)
+        create_relay_team(relay_db, eid, relay_db.shrk_id, 'B', 102.00)
+
+        num_heats = apply_relay_seeding(relay_db, eid, lanes=6)
+        assert num_heats == 1  # 3 relay teams fit in 1 heat
+
+        # Check assignments
+        rts = get_relay_teams(relay_db, event_id=eid)
+        for rt in rts:
+            assert rt['heat_id'] is not None
+            assert rt['lane'] is not None
+
+    def test_seed_relay_via_apply_seeding(self, relay_db):
+        """apply_seeding should detect relay event and route to relay seeding."""
+        eid = relay_db.relay_event_id
+        create_relay_team(relay_db, eid, relay_db.shrk_id, 'A', 95.00)
+        create_relay_team(relay_db, eid, relay_db.dolp_id, 'A', 97.50)
+
+        num_heats = apply_seeding(relay_db, eid, lanes=6)
+        assert num_heats == 1
+
+    def test_relay_seeding_empty_event(self, relay_db):
+        eid = relay_db.relay_event_id
+        num_heats = apply_relay_seeding(relay_db, eid, lanes=6)
+        assert num_heats == 0
+
+    def test_relay_heat_sheet(self, relay_db):
+        eid = relay_db.relay_event_id
+        create_relay_team(relay_db, eid, relay_db.shrk_id, 'A', 95.00)
+        create_relay_team(relay_db, eid, relay_db.dolp_id, 'A', 97.50)
+
+        apply_relay_seeding(relay_db, eid, lanes=6)
+
+        sheet = get_relay_heat_sheet(relay_db, eid)
+        assert len(sheet) == 2
+        assert 'heat' in sheet[0]
+        assert 'lane' in sheet[0]
+        assert 'team_code' in sheet[0]
+        assert 'relay_letter' in sheet[0]
+
+    def test_relay_multiple_heats(self, relay_db):
+        eid = relay_db.relay_event_id
+        # Create 8 relay teams to force multiple heats with 6 lanes
+        for i, (tid, letter) in enumerate([
+            (relay_db.shrk_id, 'A'), (relay_db.shrk_id, 'B'),
+            (relay_db.shrk_id, 'C'), (relay_db.shrk_id, 'D'),
+            (relay_db.dolp_id, 'A'), (relay_db.dolp_id, 'B'),
+            (relay_db.dolp_id, 'C'), (relay_db.dolp_id, 'D'),
+        ]):
+            create_relay_team(relay_db, eid, tid, letter, 90.0 + i)
+
+        num_heats = apply_relay_seeding(relay_db, eid, lanes=6)
+        assert num_heats == 2  # 8 teams / 6 lanes = 2 heats
+
+
+# ─── Get Team Swimmers Test ──────────────────────────────────────────
+
+class TestGetTeamSwimmers:
+    def test_get_team_swimmers(self, relay_db):
+        swimmers = get_team_swimmers(relay_db, relay_db.shrk_id)
+        assert len(swimmers) == 3  # Smith, Doe, Lee
+        assert all('name' in s for s in swimmers)
+
+    def test_get_team_swimmers_by_gender(self, relay_db):
+        males = get_team_swimmers(relay_db, relay_db.shrk_id, gender='M')
+        assert len(males) == 2  # Smith, Lee
+        assert all(s['gender'] == 'M' for s in males)
+
+        females = get_team_swimmers(relay_db, relay_db.shrk_id, gender='F')
+        assert len(females) == 1  # Doe
 
 
 # ─── Migration Tests ──────────────────────────────────────────────────
